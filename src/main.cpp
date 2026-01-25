@@ -7,15 +7,13 @@
 #include "soc/soc.h" //disable brownout problems
 #include "soc/rtc_cntl_reg.h"  //disable brownout problems
 #include "esp_http_server.h"
-
-// Micro-RTSP库头文件
-#include "CStreamer.h"
-#include "CRtspSession.h"
-#include "platglue.h"
+#include <AsyncTCP.h>
 
 //Replace with your network credentials
-const char* ssid = "lalala";
-const char* password = "lalala.666";
+const char* ssid = "优锘科技";
+const char* password = "uinnova123";
+#define REMOTE_IP   "192.168.125.116"
+#define REMOTE_PORT 1234
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 
@@ -130,43 +128,24 @@ static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 httpd_handle_t stream_httpd = NULL;
+AsyncClient client;
 
-// RTSP服务器相关变量
-WiFiServer rtspServer(8554);
-CStreamer *streamer = nullptr;
-CRtspSession *session = nullptr;
-WiFiClient client;
+// 0 == disconnected
+// 1 == connecting
+// 2 == connected
+static uint8_t state = 0;
+// 存储MAC地址字符串
+char device_id[13]; 
 
-// 自定义流处理器类，用于处理ESP32-S3-CAM的视频流
-class Esp32CamStreamer : public CStreamer {
-public:
-    Esp32CamStreamer(SOCKET aClient) : CStreamer(aClient, 1024, 768) {}
-    
-    virtual void streamImage(uint32_t curMsec) {
-        // 获取摄像头帧
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb) {
-            // 检查是否需要转换为JPEG
-            if (fb->format != PIXFORMAT_JPEG) {
-                size_t jpg_buf_len = 0;
-                uint8_t *jpg_buf = NULL;
-                bool jpeg_converted = frame2jpg(fb, 80, &jpg_buf, &jpg_buf_len);
-                esp_camera_fb_return(fb);
-                
-                if (jpeg_converted) {
-                    // 发送JPEG帧
-                    streamFrame(jpg_buf, jpg_buf_len, curMsec);
-                    free(jpg_buf);
-                }
-            } else {
-                // 直接发送JPEG帧
-                streamFrame(fb->buf, fb->len, curMsec);
-                esp_camera_fb_return(fb);
-            }
-        }
-    }
-};
+void initDeviceID() {
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    // 格式化为 00112233AABB 这种紧凑格式
+    sprintf(device_id, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.printf("设备唯一ID: %s\n", device_id);
+}
 
+// 处理视频流请求
 static esp_err_t stream_handler(httpd_req_t *req){
   camera_fb_t * fb = NULL;
   esp_err_t res = ESP_OK;
@@ -226,6 +205,7 @@ static esp_err_t stream_handler(httpd_req_t *req){
   return res;
 }
 
+// 启动视频流服务器
 void startCameraServer(){
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
@@ -243,6 +223,7 @@ void startCameraServer(){
   }
 }
 
+// 初始化相机服务器
 void initCameraServer(){
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -286,7 +267,96 @@ void initCameraServer(){
   }
 }
 
+// 连接视频流TCP服务器
+void connectTcpServer(){
+  Serial.println("connect stream channel");
+  // register a callback when the client disconnects
+  client.onDisconnect([](void *arg, AsyncClient *client) {
+    Serial.printf("Disconnected.\n");
+    state = 0;
+  });
+
+  // register a callback when an error occurs
+  client.onError([](void *arg, AsyncClient *client, int8_t error) {
+    Serial.printf("Error: %s\n", client->errorToString(error));
+  });
+
+  // register a callback when data arrives, to accumulate it
+  client.onData([](void *arg, AsyncClient *client, void *data, size_t len) {
+    // 将收到的数据转为字符串
+    String msg = "";
+    for(size_t i=0; i<len; i++){
+        msg += (char)((uint8_t*)data)[i];
+    }
+    msg.trim();
+    Serial.printf("Received Data: [%s]\n", msg.c_str());
+    if (msg == "LED_ON") {
+        digitalWrite(4, HIGH); // 打开 ESP32-CAM 闪光灯
+    } else {
+        digitalWrite(4, LOW);
+    }
+  });
+
+  // register a callback when we are connected
+  client.onConnect([](void *arg, AsyncClient *client) {
+    Serial.printf("Connected!\n");
+    state = 2;
+  });
+
+  // 注册连接成功回调
+  client.onConnect([](void *arg, AsyncClient *client) {
+    Serial.printf("Connected!\n");
+      // --- 核心优化：发送注册包 ---
+      // 格式约定为 "REG:[MAC_ADDRESS]\n"
+      char reg_msg[32];
+      int len = sprintf(reg_msg, "REG:%s\n", device_id);
+      
+      client->add(reg_msg, len);
+      client->send(); 
+      
+      state = 2; // 进入推流状态
+  }, NULL);
+
+  client.onAck([](void *arg, AsyncClient *client, size_t len, uint32_t time) {
+    Serial.printf("Acked %u bytes in %" PRIu32 " ms\n", len, time);
+  });
+
+  client.setRxTimeout(20000);
+  client.setNoDelay(true);
+}
+
+// 发送JPEG帧到TCP服务器
+void sendJpegFrame(){
+  static uint32_t lastFrameTime = 0;
+  const uint32_t frameInterval = 40; // 保持 25 FPS
+
+  while (2 == state) {
+      uint32_t now = millis();
+      if (now - lastFrameTime >= frameInterval) {
+          lastFrameTime = now;
+
+          camera_fb_t* fb = esp_camera_fb_get();
+          if (!fb) continue;
+
+          // 检查异步缓冲区是否积压，避免内存崩溃
+          if (client.canSend()) {
+              // 如果服务器需要每帧都校验，可以在这里再加一个小包头
+              // 但为了效率，建议只在连接时注册一次，后续由服务器维护 Socket 句柄与 ID 的映射
+              client.add((const char*)fb->buf, fb->len);
+              
+              uint8_t end[5] = {'j', 'p', 'e', 'g', '\n'};
+              client.add((const char*)end, 5);
+              client.send();
+          }
+
+          esp_camera_fb_return(fb);
+      }
+      yield(); // 必须调用，防止触发看门狗并允许处理异步任务
+  }
+}
+
 void setup() {
+  // 关闭 ESP32 的欠压保护，防止模组因电压波动而反复重启
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
  
   Serial.begin(115200);
@@ -305,58 +375,39 @@ void setup() {
   
   Serial.print("Camera Stream Ready! Go to: http://");
   Serial.print(WiFi.localIP());
-  
-  // Start streaming web server
-  startCameraServer();
-  
-  // Start RTSP server
-  rtspServer.begin();
-  Serial.print("\nRTSP Stream Ready! Use VLC or FFplay to connect to: rtsp://");
-  Serial.print(WiFi.localIP());
-  Serial.println(":8554/");
+  initDeviceID();
+  // 启动视频流服务器
+  // startCameraServer();
+  // 连接视频流TCP服务器
+  connectTcpServer();
 }
 
 void loop() {
-  uint32_t msecPerFrame = 100; // 10fps
-  static uint32_t lastimage = millis();
-
-  // HTTP服务器会自动处理客户端连接，不需要手动调用handle_client
-  // httpd_handle_client(stream_httpd);
-
-  // 如果有活跃的RTSP会话，处理请求并发送视频帧
-  if (session) {
-    // 处理RTSP请求
-    session->handleRequests(0);
-    
-    // 按照帧率发送视频帧
-    uint32_t now = millis();
-    if (now > lastimage + msecPerFrame || now < lastimage) { // 处理时钟溢出
-      session->broadcastCurrentFrame(now);
-      lastimage = now;
-      
-      // 检查是否超过最大帧率
-      now = millis();
-      if (now > lastimage + msecPerFrame) {
-        Serial.printf("Warning: Exceeding max frame rate of %d ms\n", now - lastimage);
+  switch (state) {
+    case 0:{
+      // 已经断开
+      Serial.printf("Connecting...\n");
+      if (!client.connect(REMOTE_IP, REMOTE_PORT)) {
+        Serial.printf("Failed to connect!\n");
+        delay(1000);  // to not flood logs
+      } else {
+        state = 1;
       }
+      break;
     }
-    
-    // 检查会话是否已停止
-    if (session->m_stopped) {
-      delete session;
-      delete streamer;
-      session = nullptr;
-      streamer = nullptr;
+    case 1:{
+      // 正在连接
+      Serial.printf("Still connecting...\n");
+      delay(500);  // to not flood logs
+      break;
     }
-  } else {
-    // 检查是否有新的RTSP客户端连接
-    client = rtspServer.accept();
-    if (client) {
-      Serial.println("New RTSP client connected");
-      
-      // 创建流处理器和RTSP会话
-      streamer = new Esp32CamStreamer(&client);
-      session = new CRtspSession(&client, streamer);
+    case 2:{
+      // 连接成功
+      Serial.printf("Connected!\n");
+      // 发送JPEG帧
+      sendJpegFrame();
+      break;
     }
+    default: break;
   }
 }
