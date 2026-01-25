@@ -1,6 +1,6 @@
 # ESP32-S3-CAM Camera Streaming Project
 
-本项目是一个基于 ESP32-S3 的摄像头流媒体服务器，使用 Arduino 框架开发，支持 WiFi 连接和实时视频流传输。
+本项目是一个基于 ESP32-S3和舵机的摄像头流媒体服务器，使用 Arduino 框架开发，支持 WiFi 连接和实时视频流传输。
 
 ## 硬件要求
 

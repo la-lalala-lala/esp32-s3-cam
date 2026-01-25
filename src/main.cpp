@@ -7,7 +7,12 @@
 #include "soc/soc.h" //disable brownout problems
 #include "soc/rtc_cntl_reg.h"  //disable brownout problems
 #include "esp_http_server.h"
+#include <ESP32Servo.h>
 
+//电源  红色的
+//接地	黑色或棕色
+//信号	黄色、橙色或白色
+// https://randomnerdtutorials.com/esp32-cam-pan-and-tilt-2-axis/
 //Replace with your network credentials
 const char* ssid = "lalala";
 const char* password = "lalala.666";
@@ -119,12 +124,78 @@ const char* password = "lalala.666";
 #else
   #error "Camera model not selected"
 #endif
+// 确定伺服电机连接的引脚。连接到 ESP32-CAM 的 GPIO 14 和 15
+#define SERVO_1 14
+#define SERVO_2 15
+
+// 构建 伺服电机控制每个电机的对象
+Servo servo1;
+Servo servo2;
+
+// 定义伺服电机的初始位置
+int servo1Pos = 0;
+int servo2Pos = 0;
 
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 httpd_handle_t stream_httpd = NULL;
+
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
+<html>
+  <head>
+    <title>ESP32-CAM Robot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: Arial; text-align: center; margin:0px auto; padding-top: 30px;}
+      table { margin-left: auto; margin-right: auto; }
+      td { padding: 8 px; }
+      .button {
+        background-color: #2f4468;
+        border: none;
+        color: white;
+        padding: 10px 20px;
+        text-align: center;
+        text-decoration: none;
+        display: inline-block;
+        font-size: 18px;
+        margin: 6px 3px;
+        cursor: pointer;
+        -webkit-touch-callout: none;
+        -webkit-user-select: none;
+        -khtml-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+        -webkit-tap-highlight-color: rgba(0,0,0,0);
+      }
+      img {  width: auto ;
+        max-width: 100% ;
+        height: auto ; 
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ESP32-CAM Pan and Tilt</h1>
+    <img src="" id="photo" >
+    <table>
+      <tr><td colspan="3" align="center"><button class="button" onmousedown="toggleCheckbox('up');" ontouchstart="toggleCheckbox('up');">Up</button></td></tr>
+      <tr><td align="center"><button class="button" onmousedown="toggleCheckbox('left');" ontouchstart="toggleCheckbox('left');">Left</button></td><td align="center"></td><td align="center"><button class="button" onmousedown="toggleCheckbox('right');" ontouchstart="toggleCheckbox('right');">Right</button></td></tr>
+      <tr><td colspan="3" align="center"><button class="button" onmousedown="toggleCheckbox('down');" ontouchstart="toggleCheckbox('down');">Down</button></td></tr>                   
+    </table>
+   <script>
+   function toggleCheckbox(x) {
+     var xhr = new XMLHttpRequest();
+     xhr.open("GET", "/action?go=" + x, true);
+     xhr.send();
+   }
+   window.onload = document.getElementById("photo").src = window.location.href.slice(0, -1) + ":81/stream";
+  </script>
+  </body>
+</html>
+)rawliteral";
+
 
 static esp_err_t stream_handler(httpd_req_t *req){
   camera_fb_t * fb = NULL;
@@ -185,6 +256,92 @@ static esp_err_t stream_handler(httpd_req_t *req){
   return res;
 }
 
+//向上：/action?go=up
+//向下：/action?go=down
+//左边：/action?go=left
+//右边：/action?go=right
+static esp_err_t action_handler(httpd_req_t *req){
+  char*  buf;
+  size_t buf_len;
+  char variable[32] = {0,};
+  
+  buf_len = httpd_req_get_url_query_len(req) + 1;
+  if (buf_len > 1) {
+    buf = (char*)malloc(buf_len);
+    if(!buf){
+      httpd_resp_send_500(req);
+      return ESP_FAIL;
+    }
+    if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+      if (httpd_query_key_value(buf, "go", variable, sizeof(variable)) == ESP_OK) {
+      } else {
+        free(buf);
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+      }
+    } else {
+      free(buf);
+      httpd_resp_send_404(req);
+      return ESP_FAIL;
+    }
+    free(buf);
+  } else {
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  //flip the camera vertically
+  //s->set_vflip(s, 1);          // 0 = disable , 1 = enable
+  // mirror effect
+  //s->set_hmirror(s, 1);          // 0 = disable , 1 = enable
+
+  int res = 0;
+  
+  if(!strcmp(variable, "up")) {
+    if(servo1Pos <= 170) {
+      servo1Pos += 10;
+      servo1.write(servo1Pos);
+    }
+    Serial.println(servo1Pos);
+    Serial.println("Up");
+  }
+  else if(!strcmp(variable, "left")) {
+    if(servo2Pos <= 170) {
+      servo2Pos += 10;
+      servo2.write(servo2Pos);
+    }
+    Serial.println(servo2Pos);
+    Serial.println("Left");
+  }
+  else if(!strcmp(variable, "right")) {
+    if(servo2Pos >= 10) {
+      servo2Pos -= 10;
+      servo2.write(servo2Pos);
+    }
+    Serial.println(servo2Pos);
+    Serial.println("Right");
+  }
+  else if(!strcmp(variable, "down")) {
+    if(servo1Pos >= 10) {
+      servo1Pos -= 10;
+      servo1.write(servo1Pos);
+    }
+    Serial.println(servo1Pos);
+    Serial.println("Down");
+  }
+  else {
+    res = -1;
+  }
+
+  if(res){
+    return httpd_resp_send_500(req);
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, NULL, 0);
+}
+
 void startCameraServer(){
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
@@ -195,10 +352,16 @@ void startCameraServer(){
     .handler   = stream_handler,
     .user_ctx  = NULL
   };
-  
+  httpd_uri_t cmd_uri = {
+    .uri       = "/action",
+    .method    = HTTP_GET,
+    .handler   = action_handler,
+    .user_ctx  = NULL
+  };
   //Serial.printf("Starting web server on port: '%d'\n", config.server_port);
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &index_uri);
+    httpd_register_uri_handler(stream_httpd, &cmd_uri);
   }
 }
 
@@ -247,7 +410,16 @@ void initCameraServer(){
 
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
- 
+  // 定义信号频率
+  servo1.setPeriodHertz(50);    // standard 50 hz servo
+  servo2.setPeriodHertz(50);    // standard 50 hz servo
+  // 设置伺服 GPIO 以及最小和最大脉冲宽度（微秒）
+  servo1.attach(SERVO_1, 1000, 2000);
+  servo2.attach(SERVO_2, 1000, 2000);
+  // 设置电机到初始位置
+  servo1.write(servo1Pos);
+  servo2.write(servo2Pos);
+
   Serial.begin(115200);
   Serial.setDebugOutput(false);
   
