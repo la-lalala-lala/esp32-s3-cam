@@ -8,6 +8,11 @@
 #include "soc/rtc_cntl_reg.h"  //disable brownout problems
 #include "esp_http_server.h"
 
+// Micro-RTSP库头文件
+#include "CStreamer.h"
+#include "CRtspSession.h"
+#include "platglue.h"
+
 //Replace with your network credentials
 const char* ssid = "lalala";
 const char* password = "lalala.666";
@@ -125,6 +130,42 @@ static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 httpd_handle_t stream_httpd = NULL;
+
+// RTSP服务器相关变量
+WiFiServer rtspServer(8554);
+CStreamer *streamer = nullptr;
+CRtspSession *session = nullptr;
+WiFiClient client;
+
+// 自定义流处理器类，用于处理ESP32-S3-CAM的视频流
+class Esp32CamStreamer : public CStreamer {
+public:
+    Esp32CamStreamer(SOCKET aClient) : CStreamer(aClient, 1024, 768) {}
+    
+    virtual void streamImage(uint32_t curMsec) {
+        // 获取摄像头帧
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            // 检查是否需要转换为JPEG
+            if (fb->format != PIXFORMAT_JPEG) {
+                size_t jpg_buf_len = 0;
+                uint8_t *jpg_buf = NULL;
+                bool jpeg_converted = frame2jpg(fb, 80, &jpg_buf, &jpg_buf_len);
+                esp_camera_fb_return(fb);
+                
+                if (jpeg_converted) {
+                    // 发送JPEG帧
+                    streamFrame(jpg_buf, jpg_buf_len, curMsec);
+                    free(jpg_buf);
+                }
+            } else {
+                // 直接发送JPEG帧
+                streamFrame(fb->buf, fb->len, curMsec);
+                esp_camera_fb_return(fb);
+            }
+        }
+    }
+};
 
 static esp_err_t stream_handler(httpd_req_t *req){
   camera_fb_t * fb = NULL;
@@ -267,8 +308,55 @@ void setup() {
   
   // Start streaming web server
   startCameraServer();
+  
+  // Start RTSP server
+  rtspServer.begin();
+  Serial.print("\nRTSP Stream Ready! Use VLC or FFplay to connect to: rtsp://");
+  Serial.print(WiFi.localIP());
+  Serial.println(":8554/");
 }
 
 void loop() {
-  delay(1);
+  uint32_t msecPerFrame = 100; // 10fps
+  static uint32_t lastimage = millis();
+
+  // HTTP服务器会自动处理客户端连接，不需要手动调用handle_client
+  // httpd_handle_client(stream_httpd);
+
+  // 如果有活跃的RTSP会话，处理请求并发送视频帧
+  if (session) {
+    // 处理RTSP请求
+    session->handleRequests(0);
+    
+    // 按照帧率发送视频帧
+    uint32_t now = millis();
+    if (now > lastimage + msecPerFrame || now < lastimage) { // 处理时钟溢出
+      session->broadcastCurrentFrame(now);
+      lastimage = now;
+      
+      // 检查是否超过最大帧率
+      now = millis();
+      if (now > lastimage + msecPerFrame) {
+        Serial.printf("Warning: Exceeding max frame rate of %d ms\n", now - lastimage);
+      }
+    }
+    
+    // 检查会话是否已停止
+    if (session->m_stopped) {
+      delete session;
+      delete streamer;
+      session = nullptr;
+      streamer = nullptr;
+    }
+  } else {
+    // 检查是否有新的RTSP客户端连接
+    client = rtspServer.accept();
+    if (client) {
+      Serial.println("New RTSP client connected");
+      
+      // 创建流处理器和RTSP会话
+      streamer = new Esp32CamStreamer(&client);
+      session = new CRtspSession(&client, streamer);
+    }
+  }
 }
